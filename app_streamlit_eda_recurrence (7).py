@@ -15,6 +15,10 @@ Application Streamlit permettant de :
   8. Mesurer la récurrence d'achat par email payeur (colonne PayerEmail) et la
      rattacher aux participants pour profiler les segments
 
+Deux pages (sélecteur dans la barre latérale) :
+  - « Segmentation des participants » (K-Means, récurrence)
+  - « Retours clients » (analyse des colonnes « À améliorer » / « Souhait »)
+
 Lancement :
     pip install -r requirements.txt
     streamlit run app.py
@@ -24,8 +28,13 @@ barre latérale.
 """
 
 import hashlib
+import html
+import hmac
 import io
+import unicodedata
 import re
+import time
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -46,6 +55,493 @@ st.set_page_config(
     page_icon="🎯",
     layout="wide",
 )
+
+# =============================================================================
+# 🔐 Authentification (porte d'accès avant toute l'application)
+# =============================================================================
+# Les mots de passe ne sont JAMAIS stockés en clair : seulement un sel + un hash
+# PBKDF2-HMAC-SHA256 (200 000 itérations) par utilisateur.
+# Pour changer les comptes sans toucher au code, définir dans .streamlit/secrets.toml :
+#   [auth_users]
+#   admin = ["<sel_hex>", "<hash_hex>"]
+AUTH_ITERATIONS = 200_000
+AUTH_MAX_ATTEMPTS = 5          # échecs avant verrouillage
+AUTH_LOCK_SECONDS = 120        # durée du verrouillage
+AUTH_SESSION_MINUTES = 120     # déconnexion automatique après inactivité
+
+_DEFAULT_AUTH_USERS = {
+    "admin": ("a4671b4f0aa017f7ee4ab849d3ac9900", "7ed5b2da6708223e2e8b8e2792a7cee5ca3e9542b9c34502d02f294e2a6be9e8"),
+    "analyste": ("f70eb9426d59dfa25262d2ead2b80d20", "897f71d8c52096fdbfdb33048554e053c75835626b6c1425c18b329ee8da34e7"),
+    "marketing": ("01e48e5b5e53fedf72670382b88200e8", "c52353b2de9cda1ac13e76950c9683eed918e502e9cf9a7f5b398a3d420b8328"),
+    # "direction": ("426614cb3c182cb639b813c98f77a65a", "71f6e7dfe476b68b4370187240da3165e072c766622cf30b0d02afe5aff6db92"),
+}
+
+
+def _auth_users() -> dict:
+    try:
+        if "auth_users" in st.secrets:
+            return {u: tuple(v) for u, v in dict(st.secrets["auth_users"]).items()}
+    except Exception:
+        pass
+    return _DEFAULT_AUTH_USERS
+
+
+@st.cache_resource
+def _auth_failures() -> dict:
+    """Compteur d'échecs partagé par tous les visiteurs du serveur (résiste au F5)."""
+    return {}
+
+
+def _check_credentials(username: str, password: str) -> bool:
+    users = _auth_users()
+    salt_hex, hash_hex = users.get(username.strip().lower(), ("00" * 16, "00" * 32))
+    candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                    bytes.fromhex(salt_hex), AUTH_ITERATIONS)
+    ok = hmac.compare_digest(candidate.hex(), hash_hex)
+    return ok and username.strip().lower() in users
+
+
+_LOGIN_CSS = """
+<style>
+:root {color-scheme: light;}
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="stHeader"], [data-testid="stToolbar"], footer {display: none !important;}
+.stApp {background: #faf9f5 !important; color: #141413;}
+.block-container {padding: 11vh 1rem 2rem !important; max-width: 460px !important;}
+[data-testid="InputInstructions"] {display: none !important;}
+[data-testid="stForm"] [data-testid="stElementContainer"]:has([data-testid="stFormSubmitButton"]),
+[data-testid="stForm"] [data-testid="stElementContainer"]:has([data-testid="stFormSubmitButton"]) div,
+[data-testid="stFormSubmitButton"] > button {width: 100% !important;}
+
+.login-brand {text-align: center; margin-bottom: 2rem; animation: fadeUp .6s ease both;}
+.login-brand .mark {
+    width: 72px; height: 72px; margin: 0 auto 1.2rem; border-radius: 20px;
+    display: flex; align-items: center; justify-content: center; font-size: 36px;
+    background: linear-gradient(135deg, #5bbcf0, #2b97dc);
+    box-shadow: 0 10px 28px rgba(56,169,232,.35);
+}
+.login-brand h1 {
+    white-space: nowrap; font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    font-weight: 400; font-size: 2.35rem; letter-spacing: -.015em; line-height: 1.15;
+    color: #141413; margin: 0 0 .6rem; padding: 0;
+}
+.login-brand p {color: #73726c; font-size: 1rem; margin: 0;}
+
+[data-testid="stForm"] {
+    background: #ffffff; border: 1px solid #e8e6dc; border-radius: 18px;
+    padding: 30px 28px 22px; box-shadow: 0 1px 2px rgba(20,20,19,.04), 0 12px 32px rgba(20,20,19,.06);
+    animation: fadeUp .7s .08s ease both;
+}
+[data-testid="stForm"] label p {color: #3d3d3a !important; font-size: .9rem; font-weight: 500;}
+[data-testid="stForm"] [data-testid="stTextInputRootElement"],
+[data-testid="stForm"] [data-baseweb="input"], [data-testid="stForm"] [data-baseweb="base-input"] {
+    background-color: #ffffff !important; border-radius: 10px !important;
+}
+[data-testid="stForm"] [data-testid="stTextInputRootElement"] {
+    border: 1px solid #d9d6ca !important; transition: border-color .18s ease, box-shadow .18s ease;
+}
+[data-testid="stForm"] [data-testid="stTextInputRootElement"]:focus-within {
+    border-color: #38a9e8 !important; box-shadow: 0 0 0 3px rgba(56,169,232,.22) !important;
+}
+[data-testid="stForm"] input {
+    color: #141413 !important; background: transparent !important;
+    -webkit-text-fill-color: #141413 !important; padding: .7rem .85rem !important;
+}
+[data-testid="stForm"] input::placeholder {color: #a8a69c !important; -webkit-text-fill-color: #a8a69c !important;}
+[data-testid="stForm"] [data-baseweb="input"] button svg {fill: #73726c !important;}
+
+[data-testid="stForm"] button[kind="secondaryFormSubmit"], [data-testid="stForm"] button[kind="primaryFormSubmit"] {
+    width: 100%; border: 0 !important; border-radius: 10px; padding: .7rem 0; margin-top: .4rem;
+    background: #1b94d8 !important; color: #ffffff !important; font-weight: 600; font-size: .98rem;
+    transition: background .18s ease, transform .12s ease;
+}
+[data-testid="stForm"] button[kind$="FormSubmit"] p {color: #ffffff !important;}
+[data-testid="stForm"] button[kind$="FormSubmit"]:hover {background: #1480ba !important;}
+[data-testid="stForm"] button[kind$="FormSubmit"]:active {transform: scale(.985);}
+
+[data-testid="stAlert"] {border-radius: 12px;}
+.login-foot {text-align: center; color: #a8a69c; font-size: .82rem; margin-top: 1.4rem;}
+@keyframes fadeUp {from {opacity: 0; transform: translateY(10px);} to {opacity: 1; transform: none;}}
+</style>
+"""
+
+
+_SIDEBAR_USER_CSS = """
+<style>
+.user-card {display: flex; align-items: center; gap: 12px; padding: 12px 14px; margin: .4rem 0 .6rem;
+    background: #ffffff; border: 1px solid #e8e6dc; border-radius: 14px;
+    box-shadow: 0 1px 2px rgba(20,20,19,.04), 0 6px 16px rgba(20,20,19,.05);}
+.user-card .avatar {flex: none; width: 42px; height: 42px; border-radius: 50%; color: #ffffff;
+    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.1rem;
+    background: linear-gradient(135deg, #5bbcf0, #2b97dc); box-shadow: 0 4px 12px rgba(56,169,232,.35);}
+.user-card .who {min-width: 0; line-height: 1.3;}
+.user-card .who small {display: flex; align-items: center; gap: 6px; color: #73726c; font-size: .7rem;
+    letter-spacing: .06em; text-transform: uppercase;}
+.user-card .who .dot {width: 7px; height: 7px; border-radius: 50%; background: #2f9e6d;
+    box-shadow: 0 0 0 3px rgba(47,158,109,.18);}
+.user-card .who b {display: block; color: #141413; font-size: 1rem; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+.st-key-logout_btn button {border-radius: 10px; font-weight: 600; color: #c4472d;
+    background: #ffffff; border: 1px solid #f0cbc2; transition: background .15s ease, border-color .15s ease;}
+.st-key-logout_btn button:hover {background: #fdf1ee; border-color: #e6a999; color: #a93a22;}
+.st-key-logout_btn button:active {transform: scale(.985);}
+</style>
+"""
+
+
+def require_login() -> None:
+    """Affiche l'écran de connexion et arrête l'exécution tant que l'accès n'est pas validé."""
+    now = time.time()
+    if st.session_state.get("auth_user"):
+        if now - st.session_state.get("auth_last_seen", now) > AUTH_SESSION_MINUTES * 60:
+            st.session_state.pop("auth_user", None)
+            st.session_state["auth_msg"] = "Session expirée, veuillez vous reconnecter."
+        else:
+            st.session_state["auth_last_seen"] = now
+            user = str(st.session_state["auth_user"])
+            st.sidebar.markdown(_SIDEBAR_USER_CSS, unsafe_allow_html=True)
+            st.sidebar.markdown(
+                f'<div class="user-card"><div class="avatar">{html.escape(user[:1].upper())}</div>'
+                f'<div class="who"><small><span class="dot"></span>Connecté</small>'
+                f"<b>{html.escape(user)}</b></div></div>",
+                unsafe_allow_html=True,
+            )
+            if st.sidebar.button("Se déconnecter", key="logout_btn", icon=":material/logout:",
+                                 width="stretch"):
+                for k in ("auth_user", "auth_last_seen"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            return
+
+    st.markdown(_LOGIN_CSS, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="login-brand"><div class="mark">🎯</div>'
+        "<h1>Heureux de vous revoir</h1>"
+        "<p>Connectez-vous pour accéder à la segmentation des participants.</p></div>",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("auth_msg"):
+        st.info(st.session_state.pop("auth_msg"))
+
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input("Identifiant", placeholder="ex. analyste")
+        password = st.text_input("Mot de passe", type="password", placeholder="Votre mot de passe")
+        submitted = st.form_submit_button("Se connecter")
+
+    if submitted:
+        key = username.strip().lower()
+        fails = _auth_failures()
+        count, locked_until = fails.get(key, (0, 0.0))
+        if locked_until > now:
+            st.error(f"🔒 Trop de tentatives. Réessayez dans {int(locked_until - now)} s.")
+        elif username and password and _check_credentials(username, password):
+            fails.pop(key, None)
+            st.session_state["auth_user"] = key
+            st.session_state["auth_last_seen"] = now
+            st.rerun()
+        else:
+            count += 1
+            if count >= AUTH_MAX_ATTEMPTS:
+                fails[key] = (0, now + AUTH_LOCK_SECONDS)
+                st.error(f"🔒 Compte verrouillé {AUTH_LOCK_SECONDS // 60} minutes après "
+                         f"{AUTH_MAX_ATTEMPTS} échecs.")
+            else:
+                fails[key] = (count, 0.0)
+                time.sleep(0.8)  # ralentit les attaques par force brute
+                st.error(f"Identifiant ou mot de passe incorrect "
+                         f"({AUTH_MAX_ATTEMPTS - count} essai(s) restant(s)).")
+
+    st.markdown('<div class="login-foot">Accès réservé aux utilisateurs autorisés</div>',
+                unsafe_allow_html=True)
+    st.stop()
+
+
+require_login()
+
+# =============================================================================
+# 💬 Page « Retours clients » (colonnes « À améliorer » / « Souhait »)
+# =============================================================================
+FB_THEMES = {
+    "Wifi": r"wi-?fi|ويفي|واي ?فاي|internet",
+    "Chargeurs / USB": r"charg|usb|type ?c|prise|شاحن|شواحن",
+    "Sièges / confort": r"seat|si[eè]ge|confort|comfort|leg ?room|كراسي|كرسي|مقاعد|راحة",
+    "Toilettes": r"toilet|restroom|\bwc\b|مرحاض|حمام",
+    "Prix": r"prix|price|cheap|pas cher|tarif|ثمن|سعر|أثمنة|اثمنة",
+    "Ponctualité": r"retard|late|delay|horaire|ponctu|تأخر|تاخر|موعد",
+    "Propreté": r"propre|clean|hygi|نظاف|نظيف",
+    "Climatisation": r"clim|air cond|تكييف|مكيف|chaud|froid",
+    "Application / réservation": r"appli|\bapp\b|site|booking|r[eé]serv|ticket|billet|تطبيق|حجز",
+    "Remboursement / annulation": r"rembours|annul|cancel|refund|modif|[ée]chang",
+    "Bagages": r"bagage|luggage|baggage|حقائب|شنطة",
+    "Personnel": r"staff|personnel|chauffeur|driver|accueil|[ée]quipe|agent|hôtesse|hotesse|موظف|سائق|طاقم|استقبال",
+    "Service": r"service|خدمة|خدمات",
+    "Destinations / fréquence": r"ville|destination|fr[eé]quen|more bus|plus de bus|مدن|وجهات|رحلات",
+    "Fidélité / promotions": r"fid[eé]lit|loyalty|r[eé]compense|reward|points|r[eé]duction|offre|promo|discount",
+}
+FB_RIEN = re.compile(
+    r"^\W*(rien|ras|rien à signaler|no|non|none|nothing|n/?a|nada|walo+|"
+    r"all (is )?(good|great|perfect)|tout (est )?(bien|parfait)|parfait|"
+    r"لا|لا شيء|لا شكرا|كل شيء (رائع|جيد)|كل شيئ جيد)\W*$", re.I)
+FB_STOP = set("pour dans avec plus vous nous the and that this with have would like more très tout "
+              "bien avoir être sont mais cette aussi comme les des une est pas sur par que qui "
+              "for you can all add make ainsi chaque entre tous oui non rien nothing everything good bon "
+              "merci better aimerais would could very really just على في من إلى عن هذا هذه كل لا".split())
+FB_COL = {"ameliorer": "À améliorer", "souhait": "Souhait"}
+
+
+def fb_clean(x):
+    return "" if pd.isna(x) else re.sub(r"_x000D_|\s+", " ", str(x)).strip()
+
+
+FB_KEYS_AME = ("amelior", "improve", "enhance", "تحسين", "تحسن")
+FB_KEYS_SOU = ("souhait", "wish", "suggest", "request", "رغب", "اقتراح", "امنية")
+
+
+def fb_norm(x) -> str:
+    """Nom de colonne normalisé : sans accents, minuscules, sans espaces ni ponctuation."""
+    t = unicodedata.normalize("NFKD", str(x))
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    return "".join(ch for ch in t.lower() if ch.isalnum())
+
+
+def fb_detect(columns) -> tuple:
+    """Détecte automatiquement les colonnes « À améliorer » et « Souhait » d'après leur nom
+    (français, anglais ou arabe). À défaut de nom reconnu, repli sur la position : la colonne
+    non encore attribuée la plus à gauche."""
+    cols = list(columns)
+    normed = [fb_norm(c) for c in cols]
+
+    def find(keys, exclude=None):
+        for c, n in zip(cols, normed):
+            if c != exclude and any(k in n for k in keys):
+                return c
+        return None
+
+    ame = find(FB_KEYS_AME)
+    sou = find(FB_KEYS_SOU, exclude=ame)
+    if ame is None:
+        ame = next((c for c in cols if c != sou), None)
+    if sou is None:
+        sou = next((c for c in cols if c != ame), None)
+    return ame, sou
+
+
+@st.cache_data(show_spinner=False)
+def fb_colonnes(file_bytes: bytes) -> list:
+    return pd.read_excel(io.BytesIO(file_bytes), nrows=0).columns.tolist()
+
+
+@st.cache_data(show_spinner="Analyse en cours…")
+def fb_charger(file_bytes: bytes, col_ame, col_sou):
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    df = df[[col_ame, col_sou]].copy()
+    df.columns = ["ameliorer", "souhait"]
+    df = df.apply(lambda s: s.map(fb_clean))
+    df["id"] = range(2, len(df) + 2)  # n° de ligne Excel
+    for c in FB_COL:
+        df[f"{c}_rien"] = df[c].str.match(FB_RIEN)
+        for t, p in FB_THEMES.items():
+            df[f"{c}|{t}"] = df[c].str.contains(p, flags=re.I, regex=True) & ~df[f"{c}_rien"]
+    df["arabe"] = (df.ameliorer + df.souhait).str.contains(r"[؀-ۿ]")
+    return df
+
+
+def render_feedback_page() -> None:
+    """Dashboard des retours clients (« À améliorer » / « Souhait »), sur une seule page
+    (sections empilées). Page autonome : fichier Excel et filtres propres, dans la barre latérale."""
+    st.title("📊 Retours clients – À améliorer / Souhait")
+
+    with st.sidebar:
+        st.divider()
+        st.header("Retours clients")
+        f = st.file_uploader("Fichier Excel des retours", type=["xlsx"], key="fb_file")
+    if f is None:
+        st.info("Chargez le fichier .xlsx des retours clients dans la barre latérale.")
+        return
+    file_bytes = f.getvalue()
+    colonnes = fb_colonnes(file_bytes)
+    if len(colonnes) < 2:
+        st.error("Le fichier doit contenir au moins deux colonnes (« À améliorer » et « Souhait »).")
+        return
+    det_ame, det_sou = fb_detect(colonnes)
+    with st.sidebar.expander("🧩 Colonnes détectées", expanded=False):
+        st.caption("Détection automatique d'après les noms de colonnes ; corrigez-la si besoin.")
+        col_ame = st.selectbox("Colonne « À améliorer »", colonnes, index=colonnes.index(det_ame),
+                               key=f"fb_col_ame_{f.name}")
+        col_sou = st.selectbox("Colonne « Souhait »", colonnes, index=colonnes.index(det_sou),
+                               key=f"fb_col_sou_{f.name}")
+    if col_ame == col_sou:
+        st.error("Choisissez deux colonnes différentes pour « À améliorer » et « Souhait ».")
+        return
+    st.caption(f"Colonnes utilisées : « À améliorer » = **{col_ame}** · « Souhait » = **{col_sou}**")
+    df = fb_charger(file_bytes, col_ame, col_sou)
+
+    with st.sidebar:
+        langue = st.segmented_control("Langue", ["Toutes", "Arabe", "Latin"], default="Toutes",
+                                      key="fb_langue") or "Toutes"
+        themes_sel = st.pills("Filtrer par thème", list(FB_THEMES), selection_mode="multi",
+                              key="fb_themes") or []
+        recherche = st.text_input("Mot-clé (texte libre)", key="fb_recherche")
+
+    d = df
+    if langue == "Arabe":
+        d = d[d.arabe]
+    elif langue == "Latin":
+        d = d[~d.arabe]
+    if themes_sel:
+        m = False
+        for c in FB_COL:
+            for t in themes_sel:
+                m = m | d[f"{c}|{t}"]
+        d = d[m]
+    if recherche:
+        m = (d.ameliorer.str.contains(recherche, case=False, regex=False)
+             | d.souhait.str.contains(recherche, case=False, regex=False))
+        d = d[m]
+
+    def utiles(c):
+        s = d[c]
+        return s[(s != "") & ~d[f"{c}_rien"]]
+
+    kp = st.columns(5)
+    kp[0].metric("Réponses (filtrées)", len(d))
+    kp[1].metric("« À améliorer » utiles", len(utiles("ameliorer")))
+    kp[2].metric("« Souhait » utiles", len(utiles("souhait")))
+    kp[3].metric("Part arabe", f"{d.arabe.mean():.0%}" if len(d) else "–")
+    kp[4].metric("Vides (2 colonnes)", int(((d.ameliorer == "") & (d.souhait == "")).sum()))
+
+    if d.empty:
+        st.warning("Aucune donnée avec ces filtres.")
+        return
+
+    # Une seule page : les sections sont empilées
+    CMAP = {"À améliorer": "#d1603d", "Souhait": "#2f7d6d"}
+
+    # ---------------------------------------------------------------- Thèmes
+    st.divider()
+    st.header("Thèmes")
+    rows = [{"Thème": t, "Colonne": FB_COL[c], "Mentions": int(d[f"{c}|{t}"].sum())}
+            for c in FB_COL for t in FB_THEMES]
+    t = pd.DataFrame(rows)
+    piv = t.pivot(index="Thème", columns="Colonne", values="Mentions")
+    piv["Total"] = piv.sum(axis=1)
+    piv = piv.sort_values("Total")
+    ordre = piv.index.tolist()
+    style = st.segmented_control("Style du graphique", ["Barres groupées", "Aires"],
+                                 default="Barres groupées", key="fb_style") or "Barres groupées"
+
+    if style == "Barres groupées":
+        fig = px.bar(t, y="Thème", x="Mentions", color="Colonne", barmode="group", orientation="h",
+                     category_orders={"Thème": ordre}, color_discrete_map=CMAP, height=650)
+    else:
+        cats = piv.sort_values("Total", ascending=False).index.tolist()
+        fig = go.Figure()
+        for c_, col_ in CMAP.items():
+            fig.add_trace(go.Scatter(x=cats, y=[piv.loc[cat, c_] for cat in cats], name=c_,
+                                     mode="lines+markers", fill="tozeroy",
+                                     line=dict(color=col_, shape="spline")))
+        fig.update_layout(height=550, yaxis_title="Mentions")
+        fig.update_xaxes(tickangle=-35)
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Une réponse peut compter dans plusieurs thèmes. Détection par mots-clés (approximative).")
+
+    # Thèmes en pourcentage : part des réponses utiles (hors vides et « Rien / RAS ») de chaque colonne
+    st.subheader("Thèmes en pourcentage")
+    st.caption("Pourcentage des réponses avec contenu de chaque colonne qui citent le thème. "
+               "Une réponse peut citer plusieurs thèmes : le total dépasse donc 100 %.")
+    base_n = {c: max(1, len(utiles(c))) for c in FB_COL}
+    pc = pd.DataFrame([{"Thème": t_, "Colonne": FB_COL[c],
+                        "Pourcentage": 100 * int(d[f"{c}|{t_}"].sum()) / base_n[c]}
+                       for c in FB_COL for t_ in FB_THEMES])
+    ordre_pc = pc.groupby("Thème").Pourcentage.sum().sort_values().index.tolist()
+    fig_pc = px.bar(pc, y="Thème", x="Pourcentage", color="Colonne", barmode="group", orientation="h",
+                    category_orders={"Thème": ordre_pc}, color_discrete_map=CMAP, height=650,
+                    text=pc.Pourcentage.map(lambda v: f"{v:.1f} %"))
+    fig_pc.update_traces(textposition="outside", cliponaxis=False)
+    fig_pc.update_xaxes(title="% des réponses avec contenu", ticksuffix=" %")
+    st.plotly_chart(fig_pc, width="stretch")
+
+    # ------------------------------------------------------- Mots fréquents
+    st.divider()
+    st.header("Mots fréquents")
+    n = st.slider("Nombre de mots", 10, 50, 20, key="fb_nmots")
+    c1, c2 = st.columns(2)
+    for col_ui, c, color in ((c1, "ameliorer", "#d1603d"), (c2, "souhait", "#2f7d6d")):
+        mots = Counter(w for x in utiles(c).str.lower()
+                       for w in re.findall(r"[\w؀-ۿ]{4,}", x) if w not in FB_STOP).most_common(n)
+        g = pd.DataFrame(mots, columns=["Mot", "Occurrences"]).iloc[::-1]
+        col_ui.subheader(FB_COL[c])
+        col_ui.plotly_chart(px.bar(g, x="Occurrences", y="Mot", orientation="h",
+                                   color_discrete_sequence=[color], height=max(350, 22 * n)),
+                            width="stretch")
+
+    # ------------------------------------------------- Autres graphiques
+    st.divider()
+    st.header("Autres graphiques")
+    th = pd.DataFrame({
+        "Thème": list(FB_THEMES),
+        "À améliorer": [int(d[f"ameliorer|{t_}"].sum()) for t_ in FB_THEMES],
+        "Souhait": [int(d[f"souhait|{t_}"].sum()) for t_ in FB_THEMES]})
+    th["Total"] = th["À améliorer"] + th["Souhait"]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Répartition des thèmes (treemap)")
+        if (th.Total > 0).any():
+            st.plotly_chart(px.treemap(th[th.Total > 0], path=["Thème"], values="Total",
+                                       color="Total", color_continuous_scale="Teal"),
+                            width="stretch")
+        else:
+            st.info("Aucun thème détecté avec ces filtres.")
+    with c2:
+        st.subheader("Langue des réponses")
+        lang = pd.Series(["Arabe" if a else "Latin (FR/EN/darija)" for a in d.arabe]).value_counts()
+        st.plotly_chart(px.pie(values=lang.values, names=lang.index, hole=0.55,
+                               color_discrete_sequence=["#2f7d6d", "#d1603d"]),
+                        width="stretch")
+
+    # ------------------------------------------- Explorer les réponses
+    st.divider()
+    st.header("Explorer les réponses")
+    st.subheader("Lire les réponses d'un thème")
+    t_choisi = st.selectbox("Thème", list(FB_THEMES), key="fb_theme_choisi")
+    colA, colB = st.columns(2)
+    for ui, c in ((colA, "ameliorer"), (colB, "souhait")):
+        sel = d.loc[d[f"{c}|{t_choisi}"], c]
+        ui.markdown(f"**{FB_COL[c]}** – {len(sel)} réponses")
+        for x in (sel.sample(min(8, len(sel)), random_state=1) if len(sel) else []):
+            ui.markdown(f"- {x[:200]}")
+
+    # Téléchargement des lignes du thème choisi
+    mask = d[f"ameliorer|{t_choisi}"] | d[f"souhait|{t_choisi}"]
+    exp = d.loc[mask, ["id", "ameliorer", "souhait"]].rename(columns={"id": "Ligne Excel", **FB_COL})
+    exp.insert(1, "Thème", t_choisi)
+    exp["Trouvé dans"] = ["Les deux" if a and b else ("À améliorer" if a else "Souhait")
+                          for a, b in zip(d.loc[mask, f"ameliorer|{t_choisi}"],
+                                          d.loc[mask, f"souhait|{t_choisi}"])]
+    st.divider()
+    st.write(f"**{len(exp)} lignes** pour le thème « {t_choisi} » (réponses citant ce thème dans au "
+             "moins une colonne, filtres de la barre latérale appliqués).")
+    nom = re.sub(r"[^\w]+", "_", t_choisi).strip("_").lower()
+    b1, b2 = st.columns(2)
+    b1.download_button("⬇️ Télécharger en CSV", exp.to_csv(index=False).encode("utf-8-sig"),
+                       f"lignes_{nom}.csv", "text/csv", disabled=exp.empty, width="stretch",
+                       key="fb_dl_csv")
+    buf = io.BytesIO()
+    exp.to_excel(buf, index=False, sheet_name=t_choisi[:30].replace("/", "-"))
+    b2.download_button("⬇️ Télécharger en Excel", buf.getvalue(), f"lignes_{nom}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       disabled=exp.empty, width="stretch", key="fb_dl_xlsx")
+
+
+# --- Navigation entre les pages -------------------------------------------------
+PAGE_SEG = "🎯 Segmentation"
+PAGE_FB = "💬 Retours clients"
+page = st.sidebar.segmented_control("🧭 Navigation", [PAGE_SEG, PAGE_FB], default=PAGE_SEG,
+                                    key="nav_page", width="stretch") or PAGE_SEG
+if page == PAGE_FB:
+    render_feedback_page()
+    st.stop()
 
 NONE_LABEL = "— Aucune —"
 SEED = 42
