@@ -31,7 +31,6 @@ import hashlib
 import html
 import hmac
 import io
-import unicodedata
 import re
 import time
 from collections import Counter
@@ -73,7 +72,7 @@ _DEFAULT_AUTH_USERS = {
     "admin": ("a4671b4f0aa017f7ee4ab849d3ac9900", "7ed5b2da6708223e2e8b8e2792a7cee5ca3e9542b9c34502d02f294e2a6be9e8"),
     "analyste": ("f70eb9426d59dfa25262d2ead2b80d20", "897f71d8c52096fdbfdb33048554e053c75835626b6c1425c18b329ee8da34e7"),
     "marketing": ("01e48e5b5e53fedf72670382b88200e8", "c52353b2de9cda1ac13e76950c9683eed918e502e9cf9a7f5b398a3d420b8328"),
-    # "direction": ("426614cb3c182cb639b813c98f77a65a", "71f6e7dfe476b68b4370187240da3165e072c766622cf30b0d02afe5aff6db92"),
+    "direction": ("426614cb3c182cb639b813c98f77a65a", "71f6e7dfe476b68b4370187240da3165e072c766622cf30b0d02afe5aff6db92"),
 }
 
 
@@ -287,94 +286,68 @@ FB_STOP = set("pour dans avec plus vous nous the and that this with have would l
               "for you can all add make ainsi chaque entre tous oui non rien nothing everything good bon "
               "merci better aimerais would could very really just على في من إلى عن هذا هذه كل لا".split())
 FB_COL = {"ameliorer": "À améliorer", "souhait": "Souhait"}
+FB_HOMME = {"h", "m", "homme", "hommes", "male", "man", "masculin", "mr", "monsieur", "ذكر", "رجل", "ذكور"}
+FB_FEMME = {"f", "femme", "femmes", "female", "woman", "féminin", "feminin", "mme", "madame", "أنثى", "انثى", "امرأة", "امراة", "إناث"}
 
 
 def fb_clean(x):
     return "" if pd.isna(x) else re.sub(r"_x000D_|\s+", " ", str(x)).strip()
 
 
-FB_KEYS_AME = ("amelior", "improve", "enhance", "تحسين", "تحسن")
-FB_KEYS_SOU = ("souhait", "wish", "suggest", "request", "رغب", "اقتراح", "امنية")
-
-
-def fb_norm(x) -> str:
-    """Nom de colonne normalisé : sans accents, minuscules, sans espaces ni ponctuation."""
-    t = unicodedata.normalize("NFKD", str(x))
-    t = "".join(ch for ch in t if not unicodedata.combining(ch))
-    return "".join(ch for ch in t.lower() if ch.isalnum())
-
-
-def fb_detect(columns) -> tuple:
-    """Détecte automatiquement les colonnes « À améliorer » et « Souhait » d'après leur nom
-    (français, anglais ou arabe). À défaut de nom reconnu, repli sur la position : la colonne
-    non encore attribuée la plus à gauche."""
-    cols = list(columns)
-    normed = [fb_norm(c) for c in cols]
-
-    def find(keys, exclude=None):
-        for c, n in zip(cols, normed):
-            if c != exclude and any(k in n for k in keys):
-                return c
-        return None
-
-    ame = find(FB_KEYS_AME)
-    sou = find(FB_KEYS_SOU, exclude=ame)
-    if ame is None:
-        ame = next((c for c in cols if c != sou), None)
-    if sou is None:
-        sou = next((c for c in cols if c != ame), None)
-    return ame, sou
-
-
-@st.cache_data(show_spinner=False)
-def fb_colonnes(file_bytes: bytes) -> list:
-    return pd.read_excel(io.BytesIO(file_bytes), nrows=0).columns.tolist()
+def fb_norm_genre(x):
+    t = fb_clean(x).lower().strip(" .")
+    return "Homme" if t in FB_HOMME else ("Femme" if t in FB_FEMME else "")
 
 
 @st.cache_data(show_spinner="Analyse en cours…")
-def fb_charger(file_bytes: bytes, col_ame, col_sou):
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    df = df[[col_ame, col_sou]].copy()
-    df.columns = ["ameliorer", "souhait"]
-    df = df.apply(lambda s: s.map(fb_clean))
+def fb_charger(file_bytes: bytes):
+    raw = pd.read_excel(io.BytesIO(file_bytes))
+    # colonne Genre : repérée par son nom (genre / sexe / gender), sinon colonne n°3
+    gcol = next((c for c in raw.columns if re.search(r"genre|sexe|gender", str(c), re.I)), None)
+    if gcol is None and raw.shape[1] >= 3:
+        gcol = raw.columns[2]
+    genre = raw[gcol].map(fb_norm_genre) if gcol is not None else pd.Series("", index=raw.index)
+    if (genre != "").mean() < 0.5:           # pas une vraie colonne de genre
+        genre = pd.Series("", index=raw.index)
+        gcol = None
+
+    # colonnes de texte : repérées par leur nom, sinon les deux premières hors genre
+    def trouve(motif):
+        return next((c for c in raw.columns if re.search(motif, str(c), re.I)), None)
+    ca, cs = trouve(r"am[ée]liorer"), trouve(r"souhait")
+    autres = [c for c in raw.columns if c != gcol]
+    ca = ca if ca is not None else autres[0]
+    cs = cs if cs is not None else [c for c in autres if c != ca][0]
+    df = pd.DataFrame({"ameliorer": raw[ca].map(fb_clean), "souhait": raw[cs].map(fb_clean), "genre": genre})
     df["id"] = range(2, len(df) + 2)  # n° de ligne Excel
     for c in FB_COL:
         df[f"{c}_rien"] = df[c].str.match(FB_RIEN)
         for t, p in FB_THEMES.items():
             df[f"{c}|{t}"] = df[c].str.contains(p, flags=re.I, regex=True) & ~df[f"{c}_rien"]
-    df["arabe"] = (df.ameliorer + df.souhait).str.contains(r"[؀-ۿ]")
+    df["arabe"] = (df.ameliorer + df.souhait).map(lambda t: bool(re.search(r"[؀-ۿ]", t)))
     return df
 
 
 def render_feedback_page() -> None:
     """Dashboard des retours clients (« À améliorer » / « Souhait »), sur une seule page
-    (sections empilées). Page autonome : fichier Excel et filtres propres, dans la barre latérale."""
+    (sections empilées), avec analyse par genre si le fichier contient une colonne Genre.
+    Page autonome : fichier Excel et filtres propres, dans la barre latérale."""
     st.title("📊 Retours clients – À améliorer / Souhait")
 
     with st.sidebar:
         st.divider()
         st.header("Retours clients")
         f = st.file_uploader("Fichier Excel des retours", type=["xlsx"], key="fb_file")
+        st.caption("Colonnes « À améliorer », « Souhait » et « Genre » détectées automatiquement par leur nom.")
     if f is None:
         st.info("Chargez le fichier .xlsx des retours clients dans la barre latérale.")
         return
-    file_bytes = f.getvalue()
-    colonnes = fb_colonnes(file_bytes)
-    if len(colonnes) < 2:
-        st.error("Le fichier doit contenir au moins deux colonnes (« À améliorer » et « Souhait »).")
+    try:
+        df = fb_charger(f.getvalue())
+    except (IndexError, ValueError, KeyError):
+        st.error("Impossible de repérer les colonnes « À améliorer » et « Souhait » : "
+                 "le fichier doit contenir au moins deux colonnes de texte.")
         return
-    det_ame, det_sou = fb_detect(colonnes)
-    with st.sidebar.expander("🧩 Colonnes détectées", expanded=False):
-        st.caption("Détection automatique d'après les noms de colonnes ; corrigez-la si besoin.")
-        col_ame = st.selectbox("Colonne « À améliorer »", colonnes, index=colonnes.index(det_ame),
-                               key=f"fb_col_ame_{f.name}")
-        col_sou = st.selectbox("Colonne « Souhait »", colonnes, index=colonnes.index(det_sou),
-                               key=f"fb_col_sou_{f.name}")
-    if col_ame == col_sou:
-        st.error("Choisissez deux colonnes différentes pour « À améliorer » et « Souhait ».")
-        return
-    st.caption(f"Colonnes utilisées : « À améliorer » = **{col_ame}** · « Souhait » = **{col_sou}**")
-    df = fb_charger(file_bytes, col_ame, col_sou)
 
     with st.sidebar:
         langue = st.segmented_control("Langue", ["Toutes", "Arabe", "Latin"], default="Toutes",
@@ -410,128 +383,196 @@ def render_feedback_page() -> None:
     kp[3].metric("Part arabe", f"{d.arabe.mean():.0%}" if len(d) else "–")
     kp[4].metric("Vides (2 colonnes)", int(((d.ameliorer == "") & (d.souhait == "")).sum()))
 
+    # Une seule page : les sections sont empilées
     if d.empty:
         st.warning("Aucune donnée avec ces filtres.")
         return
+    has_genre = bool((d.genre != "").any())
+    tab1, tabG, tab2, tab5, tab6 = (st.container() for _ in range(5))
+    for box, titre in ((tab1, "Thèmes"), (tabG, "Genre et thèmes" if has_genre else None),
+                       (tab2, "Mots fréquents"), (tab5, "Autres graphiques"), (tab6, "Explorer les réponses")):
+        if titre:
+            with box:
+                st.divider()
+                st.header(titre)
 
-    # Une seule page : les sections sont empilées
-    CMAP = {"À améliorer": "#d1603d", "Souhait": "#2f7d6d"}
+    with tab1:
+        CMAP = {"À améliorer": "#d1603d", "Souhait": "#2f7d6d"}
+        style = st.segmented_control("Style du graphique", ["Barres groupées", "Aires"],
+                                     default="Barres groupées", key="fb_style_themes") or "Barres groupées"
 
-    # ---------------------------------------------------------------- Thèmes
-    st.divider()
-    st.header("Thèmes")
-    rows = [{"Thème": t, "Colonne": FB_COL[c], "Mentions": int(d[f"{c}|{t}"].sum())}
-            for c in FB_COL for t in FB_THEMES]
-    t = pd.DataFrame(rows)
-    piv = t.pivot(index="Thème", columns="Colonne", values="Mentions")
-    piv["Total"] = piv.sum(axis=1)
-    piv = piv.sort_values("Total")
-    ordre = piv.index.tolist()
-    style = st.segmented_control("Style du graphique", ["Barres groupées", "Aires"],
-                                 default="Barres groupées", key="fb_style") or "Barres groupées"
+        def graphique_themes(long, val, xtitle, suffix="", decimales=0):
+            """Barres groupées ou aires, à partir d'un tableau Thème / Colonne / valeur."""
+            tot = long.groupby("Thème")[val].sum()
+            if style == "Barres groupées":
+                ordre_ = tot.sort_values().index.tolist()
+                txt = long[val].map(lambda v: f"{v:.{decimales}f}{suffix}")
+                fig_ = px.bar(long, y="Thème", x=val, color="Colonne", barmode="group", orientation="h",
+                              category_orders={"Thème": ordre_}, color_discrete_map=CMAP, height=700, text=txt)
+                fig_.update_traces(textposition="outside", cliponaxis=False)
+                fig_.update_xaxes(title=xtitle, ticksuffix=suffix)
+            else:
+                cats = tot.sort_values(ascending=False).index.tolist()
+                fig_ = go.Figure()
+                for c_, col_ in CMAP.items():
+                    sub = long[long.Colonne == c_].set_index("Thème").reindex(cats)
+                    fig_.add_trace(go.Scatter(x=cats, y=sub[val], name=c_, mode="lines+markers",
+                                              fill="tozeroy", line=dict(color=col_, shape="spline")))
+                fig_.update_layout(height=550)
+                fig_.update_yaxes(title=xtitle, ticksuffix=suffix)
+                fig_.update_xaxes(tickangle=-35)
+            st.plotly_chart(fig_, width="stretch")
 
-    if style == "Barres groupées":
-        fig = px.bar(t, y="Thème", x="Mentions", color="Colonne", barmode="group", orientation="h",
-                     category_orders={"Thème": ordre}, color_discrete_map=CMAP, height=650)
-    else:
-        cats = piv.sort_values("Total", ascending=False).index.tolist()
-        fig = go.Figure()
-        for c_, col_ in CMAP.items():
-            fig.add_trace(go.Scatter(x=cats, y=[piv.loc[cat, c_] for cat in cats], name=c_,
-                                     mode="lines+markers", fill="tozeroy",
-                                     line=dict(color=col_, shape="spline")))
-        fig.update_layout(height=550, yaxis_title="Mentions")
-        fig.update_xaxes(tickangle=-35)
-    st.plotly_chart(fig, width="stretch")
-    st.caption("Une réponse peut compter dans plusieurs thèmes. Détection par mots-clés (approximative).")
+        # 1. Nombre de mentions
+        st.subheader("Thèmes (nombre de mentions)")
+        cnt_long = pd.DataFrame([{"Thème": t_, "Colonne": FB_COL[c], "Mentions": int(d[f"{c}|{t_}"].sum())}
+                                 for c in FB_COL for t_ in FB_THEMES])
+        graphique_themes(cnt_long, "Mentions", "Mentions")
+        st.caption("Une réponse peut compter dans plusieurs thèmes. Détection par mots-clés (approximative).")
 
-    # Thèmes en pourcentage : part des réponses utiles (hors vides et « Rien / RAS ») de chaque colonne
-    st.subheader("Thèmes en pourcentage")
-    st.caption("Pourcentage des réponses avec contenu de chaque colonne qui citent le thème. "
-               "Une réponse peut citer plusieurs thèmes : le total dépasse donc 100 %.")
-    base_n = {c: max(1, len(utiles(c))) for c in FB_COL}
-    pc = pd.DataFrame([{"Thème": t_, "Colonne": FB_COL[c],
-                        "Pourcentage": 100 * int(d[f"{c}|{t_}"].sum()) / base_n[c]}
-                       for c in FB_COL for t_ in FB_THEMES])
-    ordre_pc = pc.groupby("Thème").Pourcentage.sum().sort_values().index.tolist()
-    fig_pc = px.bar(pc, y="Thème", x="Pourcentage", color="Colonne", barmode="group", orientation="h",
-                    category_orders={"Thème": ordre_pc}, color_discrete_map=CMAP, height=650,
-                    text=pc.Pourcentage.map(lambda v: f"{v:.1f} %"))
-    fig_pc.update_traces(textposition="outside", cliponaxis=False)
-    fig_pc.update_xaxes(title="% des réponses avec contenu", ticksuffix=" %")
-    st.plotly_chart(fig_pc, width="stretch")
+        # 2. Pourcentage des réponses avec contenu
+        st.subheader("Thèmes en pourcentage")
+        base_n = {c: max(1, len(utiles(c))) for c in FB_COL}
+        pct_long = pd.DataFrame([{"Thème": t_, "Colonne": FB_COL[c],
+                                  "Pourcentage": 100 * int(d[f"{c}|{t_}"].sum()) / base_n[c]}
+                                 for c in FB_COL for t_ in FB_THEMES])
+        graphique_themes(pct_long, "Pourcentage", "% des réponses avec contenu", " %", 1)
+        st.caption("Pourcentage des réponses avec contenu (hors vides et « Rien / RAS ») de chaque colonne qui "
+                   "citent le thème. Une réponse peut citer plusieurs thèmes : le total dépasse donc 100 %.")
 
-    # ------------------------------------------------------- Mots fréquents
-    st.divider()
-    st.header("Mots fréquents")
-    n = st.slider("Nombre de mots", 10, 50, 20, key="fb_nmots")
-    c1, c2 = st.columns(2)
-    for col_ui, c, color in ((c1, "ameliorer", "#d1603d"), (c2, "souhait", "#2f7d6d")):
-        mots = Counter(w for x in utiles(c).str.lower()
-                       for w in re.findall(r"[\w؀-ۿ]{4,}", x) if w not in FB_STOP).most_common(n)
-        g = pd.DataFrame(mots, columns=["Mot", "Occurrences"]).iloc[::-1]
-        col_ui.subheader(FB_COL[c])
-        col_ui.plotly_chart(px.bar(g, x="Occurrences", y="Mot", orientation="h",
-                                   color_discrete_sequence=[color], height=max(350, 22 * n)),
+    with tab2:
+        n = st.slider("Nombre de mots", 10, 50, 20, key="fb_nmots")
+        c1, c2 = st.columns(2)
+        for col_ui, c, color in ((c1, "ameliorer", "#d1603d"), (c2, "souhait", "#2f7d6d")):
+            mots = Counter(w for x in utiles(c).str.lower()
+                           for w in re.findall(r"[\w؀-ۿ]{4,}", x) if w not in FB_STOP).most_common(n)
+            g = pd.DataFrame(mots, columns=["Mot", "Occurrences"]).iloc[::-1]
+            col_ui.subheader(FB_COL[c])
+            col_ui.plotly_chart(px.bar(g, x="Occurrences", y="Mot", orientation="h",
+                                       color_discrete_sequence=[color], height=max(350, 22 * n)),
+                                width="stretch")
+
+    with tab5:
+        # nb de mentions par thème (les deux colonnes confondues)
+        th = pd.DataFrame({
+            "Thème": list(FB_THEMES),
+            "À améliorer": [int(d[f"ameliorer|{t_}"].sum()) for t_ in FB_THEMES],
+            "Souhait": [int(d[f"souhait|{t_}"].sum()) for t_ in FB_THEMES]})
+        th["Total"] = th["À améliorer"] + th["Souhait"]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Répartition des thèmes (treemap)")
+            if (th.Total > 0).any():
+                st.plotly_chart(px.treemap(th[th.Total > 0], path=["Thème"], values="Total",
+                                           color="Total", color_continuous_scale="Teal"),
+                                width="stretch")
+            else:
+                st.info("Aucun thème détecté avec ces filtres.")
+        with c2:
+            st.subheader("Langue des réponses")
+            lang = pd.Series(["Arabe" if a else "Latin (FR/EN/darija)" for a in d.arabe]).value_counts()
+            st.plotly_chart(px.pie(values=lang.values, names=lang.index, hole=0.55,
+                                   color_discrete_sequence=["#2f7d6d", "#d1603d"]),
                             width="stretch")
 
-    # ------------------------------------------------- Autres graphiques
-    st.divider()
-    st.header("Autres graphiques")
-    th = pd.DataFrame({
-        "Thème": list(FB_THEMES),
-        "À améliorer": [int(d[f"ameliorer|{t_}"].sum()) for t_ in FB_THEMES],
-        "Souhait": [int(d[f"souhait|{t_}"].sum()) for t_ in FB_THEMES]})
-    th["Total"] = th["À améliorer"] + th["Souhait"]
+    with tab6:
+        # Explorateur de verbatims par thème
+        st.subheader("Lire les réponses d'un thème")
+        t_choisi = st.selectbox("Thème", list(FB_THEMES), key="fb_theme_choisi")
+        colA, colB = st.columns(2)
+        for ui, c in ((colA, "ameliorer"), (colB, "souhait")):
+            sel = d.loc[d[f"{c}|{t_choisi}"], c]
+            ui.markdown(f"**{FB_COL[c]}** – {len(sel)} réponses")
+            for x in (sel.sample(min(8, len(sel)), random_state=1) if len(sel) else []):
+                ui.markdown(f"- {x[:200]}")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Répartition des thèmes (treemap)")
-        if (th.Total > 0).any():
-            st.plotly_chart(px.treemap(th[th.Total > 0], path=["Thème"], values="Total",
-                                       color="Total", color_continuous_scale="Teal"),
-                            width="stretch")
-        else:
-            st.info("Aucun thème détecté avec ces filtres.")
-    with c2:
-        st.subheader("Langue des réponses")
-        lang = pd.Series(["Arabe" if a else "Latin (FR/EN/darija)" for a in d.arabe]).value_counts()
-        st.plotly_chart(px.pie(values=lang.values, names=lang.index, hole=0.55,
-                               color_discrete_sequence=["#2f7d6d", "#d1603d"]),
-                        width="stretch")
+        # Téléchargement des lignes du thème choisi
+        mask = d[f"ameliorer|{t_choisi}"] | d[f"souhait|{t_choisi}"]
+        exp = d.loc[mask, ["id", "ameliorer", "souhait"]].rename(columns={"id": "Ligne Excel", **FB_COL})
+        exp.insert(1, "Thème", t_choisi)
+        exp["Trouvé dans"] = ["Les deux" if a and b else ("À améliorer" if a else "Souhait")
+                              for a, b in zip(d.loc[mask, f"ameliorer|{t_choisi}"],
+                                              d.loc[mask, f"souhait|{t_choisi}"])]
+        st.divider()
+        st.write(f"**{len(exp)} lignes** pour le thème « {t_choisi} » (réponses citant ce thème dans au moins "
+                 "une colonne, filtres de la barre latérale appliqués).")
+        nom = re.sub(r"[^\w]+", "_", t_choisi).strip("_").lower()
+        b1, b2 = st.columns(2)
+        b1.download_button("⬇️ Télécharger en CSV", exp.to_csv(index=False).encode("utf-8-sig"),
+                           f"lignes_{nom}.csv", "text/csv", disabled=exp.empty, width="stretch",
+                           key="fb_dl_csv")
+        buf = io.BytesIO()
+        exp.to_excel(buf, index=False, sheet_name=t_choisi[:30].replace("/", "-"))
+        b2.download_button("⬇️ Télécharger en Excel", buf.getvalue(), f"lignes_{nom}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           disabled=exp.empty, width="stretch", key="fb_dl_xlsx")
 
-    # ------------------------------------------- Explorer les réponses
-    st.divider()
-    st.header("Explorer les réponses")
-    st.subheader("Lire les réponses d'un thème")
-    t_choisi = st.selectbox("Thème", list(FB_THEMES), key="fb_theme_choisi")
-    colA, colB = st.columns(2)
-    for ui, c in ((colA, "ameliorer"), (colB, "souhait")):
-        sel = d.loc[d[f"{c}|{t_choisi}"], c]
-        ui.markdown(f"**{FB_COL[c]}** – {len(sel)} réponses")
-        for x in (sel.sample(min(8, len(sel)), random_state=1) if len(sel) else []):
-            ui.markdown(f"- {x[:200]}")
+    # Genre × thèmes (section affichée entre « Thèmes » et « Mots fréquents », si une colonne Genre existe)
+    if has_genre:
+        with tabG:
+            g1, g2 = st.columns([3, 2])
+            gstyle = g1.segmented_control(
+                "Style du graphique",
+                ["Répartition H/F par thème (100 %)", "Taux de citation par genre"],
+                default="Répartition H/F par thème (100 %)", key="fb_g_style") or "Répartition H/F par thème (100 %)"
+            gcol_ = g2.segmented_control("Colonne", ["Les deux", "À améliorer", "Souhait"],
+                                         default="Les deux", key="fb_g_col") or "Les deux"
+            cols_g = {"Les deux": ["ameliorer", "souhait"], "À améliorer": ["ameliorer"],
+                      "Souhait": ["souhait"]}[gcol_]
 
-    # Téléchargement des lignes du thème choisi
-    mask = d[f"ameliorer|{t_choisi}"] | d[f"souhait|{t_choisi}"]
-    exp = d.loc[mask, ["id", "ameliorer", "souhait"]].rename(columns={"id": "Ligne Excel", **FB_COL})
-    exp.insert(1, "Thème", t_choisi)
-    exp["Trouvé dans"] = ["Les deux" if a and b else ("À améliorer" if a else "Souhait")
-                          for a, b in zip(d.loc[mask, f"ameliorer|{t_choisi}"],
-                                          d.loc[mask, f"souhait|{t_choisi}"])]
-    st.divider()
-    st.write(f"**{len(exp)} lignes** pour le thème « {t_choisi} » (réponses citant ce thème dans au "
-             "moins une colonne, filtres de la barre latérale appliqués).")
-    nom = re.sub(r"[^\w]+", "_", t_choisi).strip("_").lower()
-    b1, b2 = st.columns(2)
-    b1.download_button("⬇️ Télécharger en CSV", exp.to_csv(index=False).encode("utf-8-sig"),
-                       f"lignes_{nom}.csv", "text/csv", disabled=exp.empty, width="stretch",
-                       key="fb_dl_csv")
-    buf = io.BytesIO()
-    exp.to_excel(buf, index=False, sheet_name=t_choisi[:30].replace("/", "-"))
-    b2.download_button("⬇️ Télécharger en Excel", buf.getvalue(), f"lignes_{nom}.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       disabled=exp.empty, width="stretch", key="fb_dl_xlsx")
+            dg = d[d.genre != ""].copy()
+            # a un contenu utile dans les colonnes choisies ? cite le thème dans au moins une d'elles ?
+            dg["utile"] = False
+            for c in cols_g:
+                dg["utile"] |= dg[c].ne("") & ~dg[f"{c}_rien"]
+            cite = pd.DataFrame({t_: dg[[f"{c}|{t_}" for c in cols_g]].any(axis=1) for t_ in FB_THEMES})
+            nG = dg[dg.utile].genre.value_counts()                  # répondants avec contenu, par genre
+            nH, nF = int(nG.get("Homme", 0)), int(nG.get("Femme", 0))
+            GC = {"Homme": "#3b6ea5", "Femme": "#c2185b"}
+
+            rows = []
+            for t_ in FB_THEMES:
+                h = int((cite[t_] & (dg.genre == "Homme")).sum())
+                f_ = int((cite[t_] & (dg.genre == "Femme")).sum())
+                rows.append({"Thème": t_, "Homme": h, "Femme": f_,
+                             "% parmi les citations": [100 * h / max(1, h + f_), 100 * f_ / max(1, h + f_)],
+                             "Taux Homme": 100 * h / max(1, nH), "Taux Femme": 100 * f_ / max(1, nF)})
+            G = pd.DataFrame(rows)
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Hommes (réponses avec contenu)", nH)
+            k2.metric("Femmes (réponses avec contenu)", nF)
+            k3.metric("Part des femmes", f"{100 * nF / max(1, nH + nF):.0f} %")
+
+            if gstyle.startswith("Répartition"):
+                long = pd.DataFrame([{"Thème": r["Thème"], "Genre": g_, "Part": r["% parmi les citations"][i]}
+                                     for _, r in G.iterrows() for i, g_ in enumerate(["Homme", "Femme"])])
+                ordre_g = G.assign(F=G["% parmi les citations"].map(lambda v: v[1])).sort_values("F")["Thème"].tolist()
+                fig = px.bar(long, y="Thème", x="Part", color="Genre", orientation="h", barmode="stack",
+                             category_orders={"Thème": ordre_g}, color_discrete_map=GC, height=700,
+                             text=long.Part.map(lambda v: f"{v:.0f} %"))
+                fig.add_vline(x=100 * nH / max(1, nH + nF), line_dash="dash", line_color="#444",
+                              annotation_text="part des hommes dans l'échantillon", annotation_position="top")
+                fig.update_xaxes(range=[0, 100], ticksuffix=" %", title="% des citations du thème")
+                st.caption("Parmi les personnes qui citent le thème, quelle part d'hommes et de femmes ? "
+                           "La ligne pointillée marque la part des hommes dans l'échantillon : au-delà, "
+                           "le thème est sur-représenté chez eux.")
+            else:
+                long = pd.DataFrame([{"Thème": r["Thème"], "Genre": g_, "Taux": r[f"Taux {g_}"]}
+                                     for _, r in G.iterrows() for g_ in ("Homme", "Femme")])
+                ordre_g = G.assign(T=G["Taux Homme"] + G["Taux Femme"]).sort_values("T")["Thème"].tolist()
+                fig = px.bar(long, y="Thème", x="Taux", color="Genre", orientation="h", barmode="group",
+                             category_orders={"Thème": ordre_g}, color_discrete_map=GC, height=700,
+                             text=long.Taux.map(lambda v: f"{v:.1f} %"))
+                fig.update_traces(textposition="outside", cliponaxis=False)
+                fig.update_xaxes(ticksuffix=" %", title="% des hommes (ou des femmes) qui citent le thème")
+                st.caption("Comparaison équitable même si l'échantillon compte plus d'hommes que de femmes : "
+                           "chaque barre est un pourcentage de son propre groupe.")
+            st.plotly_chart(fig, width="stretch")
+            if min(nH, nF) < 100:
+                st.warning(f"Échantillon réduit ({min(nH, nF)} réponses pour le plus petit groupe) : "
+                           "les écarts de quelques points peuvent être dus au hasard.")
 
 
 # --- Navigation entre les pages -------------------------------------------------
