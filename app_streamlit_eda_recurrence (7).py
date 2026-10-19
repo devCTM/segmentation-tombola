@@ -275,7 +275,8 @@ FB_THEMES = {
     "Personnel": r"staff|personnel|chauffeur|driver|accueil|[ée]quipe|agent|hôtesse|hotesse|موظف|سائق|طاقم|استقبال",
     "Service": r"service|خدمة|خدمات",
     "Destinations / fréquence": r"ville|destination|fr[eé]quen|more bus|plus de bus|مدن|وجهات|رحلات",
-    "Fidélité / promotions": r"fid[eé]lit|loyalty|r[eé]compense|reward|points|r[eé]duction|offre|promo|discount",
+    "Fidélité": r"fid[eé]l|loyalty|points|r[eé]compense|reward|membre|abonn",
+    "Promotions": r"promo|r[eé]duction|offre|discount|remise|coupon|bon plan|soldes?",
 }
 FB_RIEN = re.compile(
     r"^\W*(rien|ras|rien à signaler|no|non|none|nothing|n/?a|nada|walo+|"
@@ -315,10 +316,12 @@ def fb_charger(file_bytes: bytes):
     def trouve(motif):
         return next((c for c in raw.columns if re.search(motif, str(c), re.I)), None)
     ca, cs = trouve(r"am[ée]liorer"), trouve(r"souhait")
-    autres = [c for c in raw.columns if c != gcol]
+    acol = next((c for c in raw.columns if c != gcol and re.search(r"tranche|\b[aâ]ge\b", str(c), re.I)), None)
+    autres = [c for c in raw.columns if c not in (gcol, acol)]
     ca = ca if ca is not None else autres[0]
     cs = cs if cs is not None else [c for c in autres if c != ca][0]
-    df = pd.DataFrame({"ameliorer": raw[ca].map(fb_clean), "souhait": raw[cs].map(fb_clean), "genre": genre})
+    df = pd.DataFrame({"ameliorer": raw[ca].map(fb_clean), "souhait": raw[cs].map(fb_clean), "genre": genre,
+                       "tranche": raw[acol].map(fb_clean) if acol is not None else ""})
     df["id"] = range(2, len(df) + 2)  # n° de ligne Excel
     for c in FB_COL:
         df[f"{c}_rien"] = df[c].str.match(FB_RIEN)
@@ -338,7 +341,7 @@ def render_feedback_page() -> None:
         st.divider()
         st.header("Retours clients")
         f = st.file_uploader("Fichier Excel des retours", type=["xlsx"], key="fb_file")
-        st.caption("Colonnes « À améliorer », « Souhait » et « Genre » détectées automatiquement par leur nom.")
+        st.caption("Colonnes « À améliorer », « Souhait », « Genre » et « Tranche d'âge » détectées automatiquement par leur nom.")
     if f is None:
         st.info("Chargez le fichier .xlsx des retours clients dans la barre latérale.")
         return
@@ -388,8 +391,10 @@ def render_feedback_page() -> None:
         st.warning("Aucune donnée avec ces filtres.")
         return
     has_genre = bool((d.genre != "").any())
-    tab1, tabG, tab2, tab5, tab6 = (st.container() for _ in range(5))
+    has_age = bool((d.tranche != "").any())
+    tab1, tabG, tabA, tab2, tab5, tab6 = (st.container() for _ in range(6))
     for box, titre in ((tab1, "Thèmes"), (tabG, "Genre et thèmes" if has_genre else None),
+                       (tabA, "Thèmes par tranche d'âge" if has_age else None),
                        (tab2, "Mots fréquents"), (tab5, "Autres graphiques"), (tab6, "Explorer les réponses")):
         if titre:
             with box:
@@ -573,6 +578,61 @@ def render_feedback_page() -> None:
             if min(nH, nF) < 100:
                 st.warning(f"Échantillon réduit ({min(nH, nF)} réponses pour le plus petit groupe) : "
                            "les écarts de quelques points peuvent être dus au hasard.")
+
+
+    # Thèmes en pourcentage par tranche d'âge (si une colonne « Tranche d'âge » existe)
+    if has_age:
+        with tabA:
+            a1, a2 = st.columns([3, 2])
+            astyle = a1.segmented_control("Style du graphique", ["Barres groupées", "Heatmap"],
+                                          default="Barres groupées", key="fb_a_style") or "Barres groupées"
+            acol_ = a2.segmented_control("Colonne", ["Les deux", "À améliorer", "Souhait"],
+                                         default="Les deux", key="fb_a_col") or "Les deux"
+            cols_a = {"Les deux": ["ameliorer", "souhait"], "À améliorer": ["ameliorer"],
+                      "Souhait": ["souhait"]}[acol_]
+
+            da = d[d.tranche != ""].copy()
+            da["utile"] = False
+            for c in cols_a:
+                da["utile"] |= da[c].ne("") & ~da[f"{c}_rien"]
+            da = da[da.utile]
+            cite_a = pd.DataFrame({t_: da[[f"{c}|{t_}" for c in cols_a]].any(axis=1) for t_ in FB_THEMES})
+
+            def cle_age(x):                      # tri naturel : 18-24, 25-34, 35-44, 55+
+                m_ = re.search(r"\d+", x)
+                return (int(m_.group()) if m_ else 999, x)
+            ages = sorted(da.tranche.unique(), key=cle_age)
+            if not ages:
+                st.info("Aucune réponse avec contenu et tranche d'âge renseignée pour ces filtres.")
+            else:
+                n_age = da.tranche.value_counts()
+                etiq = {a: f"{a} (n={n_age[a]})" for a in ages}
+
+                pct = pd.DataFrame({etiq[a]: 100 * cite_a[da.tranche == a].sum() / max(1, n_age[a])
+                                    for a in ages})
+                pct = pct.loc[pct.sum(axis=1).sort_values(ascending=True).index]  # thèmes triés par poids total
+                if astyle == "Barres groupées":
+                    long = pct.reset_index(names="Thème").melt(id_vars="Thème", var_name="Tranche d'âge",
+                                                               value_name="Pourcentage")
+                    fig = px.bar(long, y="Thème", x="Pourcentage", color="Tranche d'âge", barmode="group",
+                                 orientation="h",
+                                 category_orders={"Thème": pct.index.tolist(),
+                                                  "Tranche d'âge": [etiq[a] for a in ages]},
+                                 height=max(700, 15 * len(FB_THEMES) * len(ages)),
+                                 color_discrete_sequence=px.colors.qualitative.Safe)
+                    fig.update_xaxes(ticksuffix=" %", title="% des réponses de la tranche d'âge qui citent le thème")
+                else:
+                    fig = px.imshow(pct.iloc[::-1], text_auto=".1f", aspect="auto", color_continuous_scale="Teal",
+                                    height=650, labels=dict(color="%"))
+                    fig.update_xaxes(side="top")
+                st.plotly_chart(fig, width="stretch")
+                st.caption("Pourcentage des réponses avec contenu de chaque tranche d'âge qui citent le thème "
+                           "(n = nombre de réponses avec contenu de la tranche). "
+                           "Une réponse peut citer plusieurs thèmes.")
+                petits = [a for a in ages if n_age[a] < 100]
+                if petits:
+                    st.warning("Échantillon réduit (moins de 100 réponses) pour : " + ", ".join(petits) +
+                               ". Les écarts de quelques points y sont peu fiables.")
 
 
 # --- Navigation entre les pages -------------------------------------------------
