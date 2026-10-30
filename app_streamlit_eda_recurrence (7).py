@@ -665,6 +665,8 @@ NUMERIC_LABELS = {
     "billets_par_commande_payeur": "Billets par commande (payeur)",
     "n_participants_payes_payeur": "Nb de participants payés par le même email",
     "n_emails": "Nb d'emails payeurs distincts utilisés",
+    # --- Gamme (LineBrand), calculée sur toutes les gammes du participant ---
+    "pct_premium": "Part de billets Premium (%, toutes gammes)",
 }
 
 # Variables de récurrence uniquement illustratives (profilage des segments) :
@@ -689,6 +691,7 @@ CAT_LABELS = {
     "mode_saisie": "Mode de saisie du billet",
     "tranche_anticipation": "Tranche d'anticipation",
     "classe_recurrence_payeur": "Classe de récurrence du payeur (billets)",
+    "gamme_participant": "Gamme (Confort seul / Premium seul / Mixte)",
 }
 
 
@@ -1065,10 +1068,11 @@ def top_lift_modality(part_df: pd.DataFrame, cat_col: str, cluster_id, cluster_c
 
 # Ordre de lecture "naturel" pour la phrase-portrait d'un segment, et petit
 # gabarit de formulation par variable (ex: "voyage pour Travail", "en Été").
-_SENTENCE_ORDER = ["genre", "tranche_age", "situation", "raison_principale",
+_SENTENCE_ORDER = ["gamme_participant", "genre", "tranche_age", "situation", "raison_principale",
                     "periode_principale", "accompagnement_principal",
                     "moyen_paiement", "type_agence", "mode_saisie"]
 _SENTENCE_TEMPLATES = {
+    "gamme_participant": "gamme {}",
     "raison_principale": "voyage pour {}",
     "periode_principale": "en {}",
     "moyen_paiement": "paiement {}",
@@ -1504,6 +1508,41 @@ def attach_payer_features(part: pd.DataFrame, df: pd.DataFrame, colmap: dict,
 
 
 # =============================================================================
+# Gamme (colonne LineBrand : Confort / Premium)
+# =============================================================================
+GAMMES = ["Confort", "Premium"]
+GAMME_AUTRE = "Autre / non renseigné"
+
+
+def normalize_gamme(s: pd.Series) -> pd.Series:
+    """Valeurs LineBrand nettoyées : espaces et casse ignorés, « Comfort » accepté.
+    Toute valeur qui n'est ni Confort ni Premium devient « Autre / non renseigné »."""
+    t = s.astype("string").str.strip().str.lower()
+    out = pd.Series(GAMME_AUTRE, index=s.index, dtype=object)
+    out[t.str.contains("premium", na=False)] = "Premium"
+    out[t.str.contains("confort|comfort", na=False)] = "Confort"
+    return out
+
+
+@st.cache_data(show_spinner="Calcul de la gamme par participant...")
+def build_gamme_table(df: pd.DataFrame, id_col: str, gamme_col: str) -> pd.DataFrame:
+    """Une ligne par participant, calculée sur TOUTES ses transactions (toutes gammes) :
+      - gamme_participant : « Confort seul », « Premium seul » ou « Mixte » ;
+      - pct_premium : part de ses billets en Premium (%).
+    Les lignes hors Confort/Premium sont ignorées ; un participant sans aucune ligne
+    Confort/Premium reçoit « Non renseigné »."""
+    d = pd.DataFrame({"participant_id": df[id_col].astype(str), "g": df[gamme_col]})
+    d = d[d["g"].isin(GAMMES)]
+    ct = pd.crosstab(d["participant_id"], d["g"]).reindex(columns=GAMMES, fill_value=0)
+    out = pd.DataFrame(index=ct.index)
+    out["gamme_participant"] = np.select(
+        [(ct["Confort"] > 0) & (ct["Premium"] > 0), ct["Premium"] > 0],
+        ["Mixte", "Premium seul"], default="Confort seul")
+    out["pct_premium"] = ct["Premium"] / ct.sum(axis=1) * 100
+    return out.reset_index()
+
+
+# =============================================================================
 # Interface Streamlit
 # =============================================================================
 st.title("🎯 Segmentation marketing des participants — K-Means")
@@ -1596,6 +1635,27 @@ with st.sidebar.expander("🧩 Correspondance des colonnes", expanded=False):
     order_ref_col = select_col(
         "Référence de commande (optionnel — sinon par date d'achat)", cols, [], "map_order_ref",
     )
+    linebrand_col = select_col(
+        "Gamme (LineBrand : Confort / Premium)", cols, ["LineBrand", "Line_Brand", "Line Brand", "Gamme"],
+        "map_linebrand",
+    )
+
+# Filtre de gamme (uniquement si la colonne LineBrand est associée).
+gamme_choice, recurrence_globale = "Tous", False
+if linebrand_col != NONE_LABEL:
+    st.sidebar.header("1.Gamme")
+    gamme_choice = st.sidebar.radio(
+        "Segmenter la gamme", ["Tous", "Confort", "Premium"], horizontal=True, key="gamme_choice",
+        help="« Tous » = comportement habituel. « Confort » / « Premium » ne garde que les billets "
+             "de cette gamme avant toute agrégation (segments, raisons, anticipation, exports).",
+    )
+    if gamme_choice != "Tous" and payer_email_col != NONE_LABEL:
+        recurrence_globale = st.sidebar.checkbox(
+            "Calculer la récurrence sur toutes les gammes", value=True, key="gamme_rec_globale",
+            help="Coché : la fidélité du payeur est mesurée sur l'ensemble de ses achats (Confort + "
+                 "Premium), même si les segments portent sur une seule gamme. Décoché : la "
+                 "récurrence ne compte que les billets de la gamme choisie.",
+        )
 
 seuil_intermediaire, emails_clair = 10, False
 if payer_email_col != NONE_LABEL:
@@ -1643,18 +1703,59 @@ colmap = {
     "payer_email": None if payer_email_col == NONE_LABEL else payer_email_col,
     "order_ref": None if order_ref_col == NONE_LABEL else order_ref_col,
     "tranche_cmd": None if tranche_cmd_col == NONE_LABEL else tranche_cmd_col,
+    "linebrand": None if linebrand_col == NONE_LABEL else linebrand_col,
 }
 
+# --- Gamme : normalisation de LineBrand, puis filtre sur les transactions ---------
+df_all = df_raw          # toutes les gammes (sert à la récurrence globale et à la gamme du participant)
+gamme_df = None
+if colmap.get("linebrand"):
+    df_all = df_raw.copy()
+    df_all["_gamme"] = normalize_gamme(df_all[colmap["linebrand"]])
+    gamme_df = build_gamme_table(df_all, id_col, "_gamme")
+    n_autre = int((df_all["_gamme"] == GAMME_AUTRE).sum())
+    if gamme_choice == "Tous":
+        df_raw = df_all
+    else:
+        df_raw = df_all[df_all["_gamme"] == gamme_choice].copy()
+    if df_raw.empty:
+        st.error(f"Aucune transaction pour la gamme « {gamme_choice} ».")
+        st.stop()
+
+# Les résultats K-Means déjà calculés deviennent périmés si le filtre ou le fichier change.
+GAMME_SFX = "" if gamme_choice == "Tous" else f"_{gamme_choice.lower()}"
+_sig = (file_label, sheet_name, gamme_choice, recurrence_globale)
+if st.session_state.get("_gamme_sig") != _sig:
+    for _k in ("part_df_clustered", "numeric_used", "cat_used", "var_exp", "var_exp_3d",
+               "k", "inertia", "silhouette"):
+        st.session_state.pop(_k, None)
+    st.session_state["_gamme_sig"] = _sig
+
+if gamme_choice != "Tous":
+    st.info(f"🎚️ Segmentation limitée à la gamme **{gamme_choice}** "
+            f"({fmt_int(len(df_raw))} billets).")
+
 part_df = build_participant_table(df_raw, colmap)
+if gamme_df is not None:
+    part_df = part_df.merge(gamme_df, on="participant_id", how="left")
+    part_df["gamme_participant"] = part_df["gamme_participant"].fillna("Non renseigné")
 reasons_multi = build_reasons_multihot(df_raw, colmap) if colmap.get("reason") else None
+if len(part_df) < 3:
+    st.warning("Moins de 3 participants avec ces réglages : segmentation impossible.")
+    st.stop()
+elif gamme_choice != "Tous" and len(part_df) < 300:
+    st.warning(f"Seulement {fmt_int(len(part_df))} participants en gamme {gamme_choice} : "
+               "les segments risquent d'être instables.")
 
 # Récurrence d'achat par email payeur, rattachée aux participants (variables illustratives).
+# Avec « récurrence sur toutes les gammes », les commandes du payeur sont comptées sur df_all.
+df_rec = df_all if recurrence_globale else df_raw
 payer_df = orders_df = payer_quality = None
 email_salt = get_email_salt(file_bytes)
 if colmap.get("payer_email") and colmap.get("date"):
-    payer_df, orders_df, payer_quality = build_payer_table(df_raw, colmap, seuil_intermediaire)
+    payer_df, orders_df, payer_quality = build_payer_table(df_rec, colmap, seuil_intermediaire)
     if not payer_df.empty:
-        part_df = attach_payer_features(part_df, df_raw, colmap, payer_df, email_salt, emails_clair)
+        part_df = attach_payer_features(part_df, df_rec, colmap, payer_df, email_salt, emails_clair)
 elif colmap.get("payer_email"):
     st.sidebar.warning("Associez aussi la « Date d'achat » pour calculer la récurrence.")
 
@@ -2057,7 +2158,7 @@ with tab_kcompare:
             st.download_button(
                 f"⬇️ Télécharger l'Excel — k = {kk_} (données brutes + segment)",
                 data=_excel_scenario,
-                file_name=f"participants_segmentes_k{kk_}.xlsx",
+                file_name=f"participants_segmentes_k{kk_}{GAMME_SFX}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"dl_scenario_k{kk_}",
             )
@@ -2257,6 +2358,9 @@ with tab_recurrence:
             cmd_def = "1 email + 1 jour"
             cmd_expl = "Une **commande** = un email + un jour d'achat (5 billets achetés d'un coup = 1 commande). "
         st.caption(cmd_expl + f"Période observée : {q['date_min']:%d/%m/%Y} → {q['date_max']:%d/%m/%Y}.")
+        if recurrence_globale:
+            st.info("Récurrence calculée sur **toutes les gammes** (Confort + Premium), alors que les "
+                    f"segments portent sur la gamme {gamme_choice}.")
 
         with st.expander("Domaines les plus fréquents (repérer fautes de frappe et emails génériques)"):
             st.dataframe(
@@ -2396,8 +2500,8 @@ with tab_export:
         # Colonnes de récurrence (si disponibles) : pratiques pour cibler les segments en CRM.
         # `payeur_id` est un pseudonyme ; `email_principal` n'existe que si l'option « emails
         # en clair » est cochée dans la barre latérale.
-        extra_cols = [c for c in ["payeur_id", "email_principal", "n_commandes_payeur",
-                                   "classe_recurrence_payeur"] if c in pdf.columns]
+        extra_cols = [c for c in ["gamme_participant", "pct_premium", "payeur_id", "email_principal",
+                                   "n_commandes_payeur", "classe_recurrence_payeur"] if c in pdf.columns]
         export_cols = ["participant_id", "cluster"] + num_used + c_used + extra_cols
         export_cols = list(dict.fromkeys(c for c in export_cols if c in pdf.columns))
         export_df = pdf[export_cols]
@@ -2423,7 +2527,7 @@ with tab_export:
         with col1:
             st.download_button(
                 "⬇️ Télécharger le fichier Excel", data=excel_bytes,
-                file_name="participants_segmentes.xlsx",
+                file_name=f"participants_segmentes{GAMME_SFX}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 width="stretch",
             )
@@ -2431,6 +2535,6 @@ with tab_export:
             csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "⬇️ Télécharger le fichier CSV", data=csv_bytes,
-                file_name="participants_segmentes.csv", mime="text/csv",
+                file_name=f"participants_segmentes{GAMME_SFX}.csv", mime="text/csv",
                 width="stretch",
             )
