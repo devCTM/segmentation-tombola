@@ -1091,6 +1091,8 @@ def majority_modality(part_df: pd.DataFrame, cat_col: str, cluster_id, cluster_c
     """Modalité la plus fréquente au sein du segment (simple majorité, sans comparaison
     à la moyenne globale) — utilisée pour la phrase-portrait "type" d'un segment."""
     cluster_dist = part_df.loc[part_df[cluster_col] == cluster_id, cat_col].value_counts(normalize=True)
+    if cat_col == "gamme_participant":
+        cluster_dist = cluster_dist.drop(labels=["Non renseigné"], errors="ignore")
     if cluster_dist.empty:
         return None, None
     return cluster_dist.index[0], cluster_dist.iloc[0] * 100
@@ -1102,6 +1104,8 @@ def modality_breakdown(part_df: pd.DataFrame, cat_col: str, cluster_id, cluster_
     majoritaire. Les modalités au-delà de max_modalities sont regroupées sous un
     total "+N autre(s)" pour rester lisible sur les variables à forte cardinalité."""
     dist = part_df.loc[part_df[cluster_col] == cluster_id, cat_col].value_counts(normalize=True) * 100
+    if cat_col == "gamme_participant":
+        dist = dist.drop(labels=["Non renseigné"], errors="ignore")  # masqué à l'affichage
     if dist.empty:
         return ""
     top = dist.iloc[:max_modalities]
@@ -1643,7 +1647,7 @@ with st.sidebar.expander("🧩 Correspondance des colonnes", expanded=False):
 # Filtre de gamme (uniquement si la colonne LineBrand est associée).
 gamme_choice, recurrence_globale = "Tous", False
 if linebrand_col != NONE_LABEL:
-    st.sidebar.header("1.Gamme")
+    st.sidebar.header("1 bis. Gamme")
     gamme_choice = st.sidebar.radio(
         "Segmenter la gamme", ["Tous", "Confort", "Premium"], horizontal=True, key="gamme_choice",
         help="« Tous » = comportement habituel. « Confort » / « Premium » ne garde que les billets "
